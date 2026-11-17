@@ -128,6 +128,16 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        # 纯 prefill 步允许更大的分块（与 decode 的投机槽位预算解耦）：
+        #   VLLM_MAX_PREFILL_CHUNK 默认取 max_num_batched_tokens；
+        #   decode 步仍用 max_num_scheduled_tokens（受投机槽位约束）。
+        import os as _os
+        _chunk = _os.environ.get("VLLM_MAX_PREFILL_CHUNK")
+        self.max_prefill_chunk = (
+            min(int(_chunk), self.scheduler_config.max_num_batched_tokens)
+            if _chunk
+            else self.max_num_scheduled_tokens
+        )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -622,6 +632,9 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # 没有任何 decode 请求在跑时（纯 prefill 步），把预算放大到 prefill 分块上限
+        if not self.running:
+            token_budget = max(token_budget, self.max_prefill_chunk)
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens

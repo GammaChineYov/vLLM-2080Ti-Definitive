@@ -374,7 +374,8 @@ def main():
 
     # Get vocab size from HF config without loading the full model
     hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    vocab_size = hf_config.vocab_size
+    # 本地补丁：Qwen3_5 的 vocab_size 挂在 text_config 下（2026-11-15）
+    vocab_size = getattr(hf_config, 'vocab_size', None) or hf_config.get_text_config().vocab_size
     prompts = make_random_prompts(args.num_prompts, args.prompt_len, vocab_size)
     print(
         f"Generated {args.num_prompts} prompts, "

@@ -1795,6 +1795,13 @@ prepare_disk_kv_checkpoint_fingerprint() {
   DISK_KV_CHECKPOINT_FINGERPRINT=""
   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
 
+  # 本地补丁 (2026-11-17): 允许外层脚本预置指纹（带 stat-key 缓存），
+  # 避免每次启动都对 30GB 模型文件做全量 SHA-256（NTFS 挂载上要 1~2 分钟）。
+  if [[ -n "${DISK_KV_CHECKPOINT_FINGERPRINT_PRE:-}" ]]; then
+    DISK_KV_CHECKPOINT_FINGERPRINT="$DISK_KV_CHECKPOINT_FINGERPRINT_PRE"
+    return 0
+  fi
+
   local method draft_checkpoint=""
   method=$(effective_speculative_method)
   if [[ "$method" != none && "$method" != mtp && -n "$method" ]]; then
@@ -4974,6 +4981,13 @@ build_args() {
   [[ -n "${ADDITIONAL_CONFIG_JSON:-}" ]] && VLLM_ARGS+=(--additional-config "$ADDITIONAL_CONFIG_JSON")
   [[ -n "${HF_OVERRIDES_JSON:-}" ]] && VLLM_ARGS+=(--hf-overrides "$HF_OVERRIDES_JSON")
 
+  # Local patch (landrom-ubuntu, 2026-11-14): allow passing vLLM-only flags that the
+  # launcher does not model (used to enable --profiler-config for decode profiling).
+  if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
+    read -r -a _extra_vllm <<<"$EXTRA_VLLM_ARGS"
+    VLLM_ARGS+=("${_extra_vllm[@]}")
+  fi
+
   if [[ -n "${MM_LIMIT_JSON:-}" ]]; then
     VLLM_ARGS+=(--limit-mm-per-prompt "$MM_LIMIT_JSON")
   elif [[ "$MODEL_FAMILY" == qwen* && -z "${ADDITIONAL_CONFIG_JSON:-}" ]]; then
@@ -5954,6 +5968,11 @@ check_checkpoint_mmap_policy() {
   [[ -r /proc/sys/vm/overcommit_memory ]] || return 0
   overcommit=$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || true)
   [[ "$overcommit" == "0" ]] || return 0
+  # Local patch (landrom-ubuntu, 2026-11-14): this host has vm.overcommit_memory=0
+  # and no passwordless sudo, while CommitLimit < Committed_AS makes the computed
+  # headroom negative, so the preflight would always abort non-interactive launches.
+  # The checkpoint mmap itself works because MemAvailable is far above the model size.
+  [[ "${SKIP_CHECKPOINT_MMAP_PREFLIGHT:-0}" == "1" ]] && return 0
 
   largest_line=$(largest_safetensors_file)
   [[ -n "$largest_line" ]] || return 0

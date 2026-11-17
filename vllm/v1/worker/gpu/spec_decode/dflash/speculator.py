@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 import torch
@@ -353,6 +354,42 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        # [本地实验补丁 2026-11-15] DFlash2 训练特征抓取：把目标 hidden states 落盘。
+        _cap_dir = os.environ.get("DFLASH_CAPTURE_DIR")
+        # 绝不能在 CUDA 图捕获中做 .cpu() 拷贝：会引发 "unspecified launch failure"（2026-11-15 实测）
+        _capturing = False
+        try:
+            import torch as _t0
+            _capturing = _t0.cuda.is_current_stream_capturing()
+        except Exception:
+            _capturing = False
+        if _cap_dir and not dummy_run and not _capturing:
+            try:
+                _max = int(os.environ.get("DFLASH_CAPTURE_MAX", "2"))
+                # TP>1 时每个 worker 都会进到这里；文件名带 rank，避免互相覆盖
+                _rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+                _cnt = getattr(type(self), "_dflash_cap_n", 0)
+                if _cnt < _max:
+                    import torch as _t
+                    _payload = {
+                        "last": last_hidden_states.detach().to(_t.float16).cpu(),
+                        "aux": ([a.detach().to(_t.float16).cpu() for a in aux_hidden_states]
+                                if aux_hidden_states is not None else None),
+                        # 训练对齐需要：本步调度到的 token 位置与请求长度
+                        "positions": input_batch.positions[:input_batch.num_tokens].detach().cpu(),
+                        "seq_lens": input_batch.seq_lens[:input_batch.num_reqs].detach().cpu(),
+                        "num_reqs": int(input_batch.num_reqs),
+                        "num_tokens": int(input_batch.num_tokens),
+                    }
+                    _path = f"{_cap_dir}/propose-r{_rank}-{_cnt}.pt"
+                    _t.save(_payload, _path)
+                    type(self)._dflash_cap_n = _cnt + 1
+                    logger.info("DFlash capture %s last=%s aux=%s", _path,
+                                tuple(last_hidden_states.shape),
+                                None if aux_hidden_states is None
+                                else [tuple(a.shape) for a in aux_hidden_states])
+            except Exception as _exc:
+                logger.warning("DFlash capture failed: %s", _exc)
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
